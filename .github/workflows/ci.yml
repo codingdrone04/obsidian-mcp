@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [dev]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt ruff
+
+      - name: Lint (ruff)
+        run: ruff check server.py
+
+      - name: Check .env.example has no real secrets
+        run: |
+          if grep -qE 'your-domain\.example\.com|changeme|your-secret-key' .env.example; then
+            echo "✅ .env.example looks clean (placeholders only)"
+          fi
+          if grep -qE '[a-f0-9]{32,}' .env.example; then
+            echo "❌ .env.example may contain a real secret!" && exit 1
+          fi
