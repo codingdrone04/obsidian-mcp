@@ -2,17 +2,23 @@
 Obsidian MCP Server — OAuth 2.1 + DCR
 FastMCP 2.0 mounted on FastAPI with full Authorization Code flow.
 """
+import base64
+import contextlib
+import hashlib
+import json
 import os
 import secrets
+import sqlite3
 import time
-from datetime import datetime, timedelta
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import jwt
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 import uvicorn
@@ -28,14 +34,133 @@ JWT_SECRET = os.getenv("JWT_SECRET_KEY", "dev-secret-change-in-production")
 TOKEN_EXPIRY = int(os.getenv("TOKEN_EXPIRY_SECONDS", "3600"))
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
+DB_PATH = os.getenv("DB_PATH", "/data/auth.db")
 
-# ── In-memory stores ───────────────────────────────────────────────────────────
-# clients: { client_id: { client_secret, client_name, redirect_uris } }
-clients: dict[str, dict] = {}
-# auth_codes: { code: { client_id, redirect_uri, expires_at } }
-auth_codes: dict[str, dict] = {}
-# access_tokens: { jti: { client_id, expires_at } }
-access_tokens: dict[str, dict] = {}
+# ── Rate limit (in-memory, ephemeral by design) ────────────────────────────────
+_failed_attempts: dict[str, list[float]] = defaultdict(list)
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "5"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "300"))
+
+# ── SQLite helpers ─────────────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def _db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _init_db() -> None:
+    with _db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS clients (
+                client_id   TEXT PRIMARY KEY,
+                client_secret TEXT NOT NULL,
+                client_name   TEXT NOT NULL,
+                redirect_uris TEXT NOT NULL,
+                grant_types   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS auth_codes (
+                code                  TEXT PRIMARY KEY,
+                client_id             TEXT NOT NULL,
+                redirect_uri          TEXT NOT NULL,
+                expires_at            REAL NOT NULL,
+                code_challenge        TEXT DEFAULT '',
+                code_challenge_method TEXT DEFAULT 'S256'
+            );
+            CREATE TABLE IF NOT EXISTS access_tokens (
+                jti        TEXT PRIMARY KEY,
+                client_id  TEXT NOT NULL,
+                expires_at REAL NOT NULL
+            );
+        """)
+        # Purge expired rows on startup
+        now = time.time()
+        conn.execute("DELETE FROM auth_codes WHERE expires_at < ?", (now,))
+        conn.execute("DELETE FROM access_tokens WHERE expires_at < ?", (now,))
+
+
+def _client_save(client_id: str, data: dict) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO clients VALUES (?, ?, ?, ?, ?)",
+            (
+                client_id,
+                data["client_secret"],
+                data["client_name"],
+                json.dumps(data["redirect_uris"]),
+                json.dumps(data["grant_types"]),
+            ),
+        )
+
+
+def _client_get(client_id: str) -> dict | None:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM clients WHERE client_id = ?", (client_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "client_secret": row["client_secret"],
+        "client_name": row["client_name"],
+        "redirect_uris": json.loads(row["redirect_uris"]),
+        "grant_types": json.loads(row["grant_types"]),
+    }
+
+
+def _code_save(code: str, data: dict) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO auth_codes VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                code,
+                data["client_id"],
+                data["redirect_uri"],
+                data["expires_at"],
+                data.get("code_challenge", ""),
+                data.get("code_challenge_method", "S256"),
+            ),
+        )
+
+
+def _code_pop(code: str) -> dict | None:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM auth_codes WHERE code = ?", (code,)
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute("DELETE FROM auth_codes WHERE code = ?", (code,))
+    return {
+        "client_id": row["client_id"],
+        "redirect_uri": row["redirect_uri"],
+        "expires_at": row["expires_at"],
+        "code_challenge": row["code_challenge"],
+        "code_challenge_method": row["code_challenge_method"],
+    }
+
+
+def _token_save(jti: str, client_id: str, expires_at: int) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO access_tokens VALUES (?, ?, ?)",
+            (jti, client_id, expires_at),
+        )
+
+
+def _token_exists(jti: str) -> bool:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM access_tokens WHERE jti = ?", (jti,)
+        ).fetchone()
+    return row is not None
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -54,7 +179,7 @@ def _issue_jwt(client_id: str) -> tuple[str, int]:
         "scope": "obsidian:read obsidian:write",
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    access_tokens[jti] = {"client_id": client_id, "expires_at": exp}
+    _token_save(jti, client_id, exp)
     return token, TOKEN_EXPIRY
 
 
@@ -66,12 +191,29 @@ def _validate_bearer(token: str) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
     jti = payload.get("jti")
-    if jti not in access_tokens:
+    if not _token_exists(jti):
         raise HTTPException(status_code=401, detail="Token revoked or unknown")
     return payload
 
 
+def _verify_pkce(verifier: str, challenge: str) -> bool:
+    digest = hashlib.sha256(verifier.encode()).digest()
+    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return computed == challenge
+
+
+def _is_rate_limited(ip: str) -> bool:
+    now = time.time()
+    _failed_attempts[ip] = [t for t in _failed_attempts[ip] if now - t < RATE_LIMIT_WINDOW]
+    return len(_failed_attempts[ip]) >= RATE_LIMIT_MAX
+
+
+def _record_failed(ip: str) -> None:
+    _failed_attempts[ip].append(time.time())
+
+
 # ── FastMCP app (created early so lifespan is available for FastAPI) ──────────
+_init_db()
 mcp = FastMCP("obsidian")
 _mcp_http_app = mcp.http_app(path="/")
 
@@ -93,12 +235,12 @@ class DCRRequest(BaseModel):
 async def oauth_register(body: DCRRequest):
     client_id = secrets.token_urlsafe(16)
     client_secret = secrets.token_urlsafe(32)
-    clients[client_id] = {
+    _client_save(client_id, {
         "client_secret": client_secret,
         "client_name": body.client_name,
         "redirect_uris": body.redirect_uris,
         "grant_types": body.grant_types,
-    }
+    })
     return {
         "client_id": client_id,
         "client_secret": client_secret,
@@ -171,6 +313,8 @@ _CONSENT_HTML = """<!DOCTYPE html>
     <input type="hidden" name="redirect_uri" value="{redirect_uri}">
     <input type="hidden" name="state" value="{state}">
     <input type="hidden" name="response_type" value="code">
+    <input type="hidden" name="code_challenge" value="{code_challenge}">
+    <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
     <label for="password">Mot de passe de consentement</label>
     <input type="password" id="password" name="password" placeholder="••••••••" autofocus>
     {error}
@@ -187,10 +331,12 @@ async def oauth_authorize_get(
     redirect_uri: str,
     state: str = "",
     response_type: str = "code",
+    code_challenge: str = "",
+    code_challenge_method: str = "S256",
 ):
-    if client_id not in clients:
+    client = _client_get(client_id)
+    if not client:
         raise HTTPException(status_code=400, detail="Unknown client_id")
-    client = clients[client_id]
     if redirect_uri not in client["redirect_uris"]:
         raise HTTPException(status_code=400, detail="redirect_uri not registered")
     html = _CONSENT_HTML.format(
@@ -198,6 +344,8 @@ async def oauth_authorize_get(
         client_id=client_id,
         redirect_uri=redirect_uri,
         state=state,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
         error="",
     )
     return HTMLResponse(html)
@@ -205,32 +353,45 @@ async def oauth_authorize_get(
 
 @app.post("/oauth/authorize", response_class=HTMLResponse)
 async def oauth_authorize_post(
+    request: Request,
     client_id: str = Form(...),
     redirect_uri: str = Form(...),
     state: str = Form(""),
     response_type: str = Form("code"),
     password: str = Form(...),
+    code_challenge: str = Form(""),
+    code_challenge_method: str = Form("S256"),
 ):
-    if client_id not in clients:
+    ip = request.client.host if request.client else "unknown"
+
+    if _is_rate_limited(ip):
+        return HTMLResponse("Too many failed attempts. Try again in 5 minutes.", status_code=429)
+
+    client = _client_get(client_id)
+    if not client:
         raise HTTPException(status_code=400, detail="Unknown client_id")
-    client = clients[client_id]
 
     if password != CONSENT_PASSWORD:
+        _record_failed(ip)
         html = _CONSENT_HTML.format(
             client_name=client["client_name"],
             client_id=client_id,
             redirect_uri=redirect_uri,
             state=state,
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method,
             error='<p class="error">Mot de passe incorrect.</p>',
         )
         return HTMLResponse(html, status_code=200)
 
     code = secrets.token_urlsafe(32)
-    auth_codes[code] = {
+    _code_save(code, {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "expires_at": time.time() + 600,  # 10 min
-    }
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+    })
     sep = "&" if "?" in redirect_uri else "?"
     location = f"{redirect_uri}{sep}code={code}&state={state}"
     return RedirectResponse(location, status_code=302)
@@ -254,18 +415,27 @@ async def oauth_token(request: Request):
     client_id = body.get("client_id")
     client_secret = body.get("client_secret")
 
-    if code not in auth_codes:
+    code_data = _code_pop(code)
+    if not code_data:
         raise HTTPException(status_code=400, detail="Invalid or expired code")
 
-    code_data = auth_codes.pop(code)  # single-use
     if time.time() > code_data["expires_at"]:
         raise HTTPException(status_code=400, detail="Code expired")
     if code_data["client_id"] != client_id:
         raise HTTPException(status_code=400, detail="client_id mismatch")
 
-    if client_id not in clients:
+    stored_challenge = code_data.get("code_challenge", "")
+    if stored_challenge:
+        code_verifier = body.get("code_verifier", "")
+        if not code_verifier:
+            raise HTTPException(status_code=400, detail="code_verifier required")
+        if not _verify_pkce(code_verifier, stored_challenge):
+            raise HTTPException(status_code=400, detail="PKCE verification failed")
+
+    client = _client_get(client_id)
+    if not client:
         raise HTTPException(status_code=401, detail="Unknown client")
-    if clients[client_id]["client_secret"] != client_secret:
+    if client["client_secret"] != client_secret:
         raise HTTPException(status_code=401, detail="Invalid client_secret")
 
     token, expires_in = _issue_jwt(client_id)
@@ -300,7 +470,7 @@ async def oauth_metadata():
         "grant_types_supported": ["authorization_code"],
         "token_endpoint_auth_methods_supported": ["client_secret_post"],
         "scopes_supported": ["obsidian:read", "obsidian:write"],
-        "code_challenge_methods_supported": [],
+        "code_challenge_methods_supported": ["S256"],
     }
 
 
