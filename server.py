@@ -2,6 +2,8 @@
 Obsidian MCP Server — OAuth 2.1 + DCR
 FastMCP 2.0 mounted on FastAPI with full Authorization Code flow.
 """
+import base64
+import hashlib
 import os
 import secrets
 import time
@@ -69,6 +71,12 @@ def _validate_bearer(token: str) -> dict:
     if jti not in access_tokens:
         raise HTTPException(status_code=401, detail="Token revoked or unknown")
     return payload
+
+
+def _verify_pkce(verifier: str, challenge: str) -> bool:
+    digest = hashlib.sha256(verifier.encode()).digest()
+    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return computed == challenge
 
 
 # ── FastMCP app (created early so lifespan is available for FastAPI) ──────────
@@ -171,6 +179,8 @@ _CONSENT_HTML = """<!DOCTYPE html>
     <input type="hidden" name="redirect_uri" value="{redirect_uri}">
     <input type="hidden" name="state" value="{state}">
     <input type="hidden" name="response_type" value="code">
+    <input type="hidden" name="code_challenge" value="{code_challenge}">
+    <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
     <label for="password">Mot de passe de consentement</label>
     <input type="password" id="password" name="password" placeholder="••••••••" autofocus>
     {error}
@@ -187,6 +197,8 @@ async def oauth_authorize_get(
     redirect_uri: str,
     state: str = "",
     response_type: str = "code",
+    code_challenge: str = "",
+    code_challenge_method: str = "S256",
 ):
     if client_id not in clients:
         raise HTTPException(status_code=400, detail="Unknown client_id")
@@ -198,6 +210,8 @@ async def oauth_authorize_get(
         client_id=client_id,
         redirect_uri=redirect_uri,
         state=state,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
         error="",
     )
     return HTMLResponse(html)
@@ -210,6 +224,8 @@ async def oauth_authorize_post(
     state: str = Form(""),
     response_type: str = Form("code"),
     password: str = Form(...),
+    code_challenge: str = Form(""),
+    code_challenge_method: str = Form("S256"),
 ):
     if client_id not in clients:
         raise HTTPException(status_code=400, detail="Unknown client_id")
@@ -221,6 +237,8 @@ async def oauth_authorize_post(
             client_id=client_id,
             redirect_uri=redirect_uri,
             state=state,
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method,
             error='<p class="error">Mot de passe incorrect.</p>',
         )
         return HTMLResponse(html, status_code=200)
@@ -230,6 +248,8 @@ async def oauth_authorize_post(
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "expires_at": time.time() + 600,  # 10 min
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
     }
     sep = "&" if "?" in redirect_uri else "?"
     location = f"{redirect_uri}{sep}code={code}&state={state}"
@@ -262,6 +282,14 @@ async def oauth_token(request: Request):
         raise HTTPException(status_code=400, detail="Code expired")
     if code_data["client_id"] != client_id:
         raise HTTPException(status_code=400, detail="client_id mismatch")
+
+    stored_challenge = code_data.get("code_challenge", "")
+    if stored_challenge:
+        code_verifier = body.get("code_verifier", "")
+        if not code_verifier:
+            raise HTTPException(status_code=400, detail="code_verifier required")
+        if not _verify_pkce(code_verifier, stored_challenge):
+            raise HTTPException(status_code=400, detail="PKCE verification failed")
 
     if client_id not in clients:
         raise HTTPException(status_code=401, detail="Unknown client")
@@ -300,7 +328,7 @@ async def oauth_metadata():
         "grant_types_supported": ["authorization_code"],
         "token_endpoint_auth_methods_supported": ["client_secret_post"],
         "scopes_supported": ["obsidian:read", "obsidian:write"],
-        "code_challenge_methods_supported": [],
+        "code_challenge_methods_supported": ["S256"],
     }
 
 
