@@ -30,6 +30,7 @@ load_dotenv()
 VAULT_PATH = Path(os.getenv("VAULT_PATH", "/vault"))
 OAUTH_DOMAIN = os.getenv("OAUTH_DOMAIN", "http://localhost:8000")
 CONSENT_PASSWORD = os.getenv("CONSENT_PASSWORD", "changeme123")
+REGISTRATION_SECRET = os.getenv("REGISTRATION_SECRET", "")
 JWT_SECRET = os.getenv("JWT_SECRET_KEY", "dev-secret-change-in-production")
 TOKEN_EXPIRY = int(os.getenv("TOKEN_EXPIRY_SECONDS", "3600"))
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
@@ -232,7 +233,12 @@ class DCRRequest(BaseModel):
 
 
 @app.post("/oauth/register")
-async def oauth_register(body: DCRRequest):
+async def oauth_register(body: DCRRequest, request: Request):
+    if REGISTRATION_SECRET:
+        auth_header = request.headers.get("Authorization", "")
+        expected = f"Bearer {REGISTRATION_SECRET}"
+        if auth_header != expected:
+            raise HTTPException(status_code=401, detail="Invalid registration secret")
     client_id = secrets.token_urlsafe(16)
     client_secret = secrets.token_urlsafe(32)
     _client_save(client_id, {
@@ -541,8 +547,9 @@ def append_to_note(note: str, content: str, folder: str = "") -> str:
     """Append content to an existing note (creates if absent)."""
     path = _note_path(folder, note)
     path.parent.mkdir(parents=True, exist_ok=True)
+    preexisting = path.exists()
     with path.open("a", encoding="utf-8") as f:
-        f.write(("\n" if path.exists() else "") + content)
+        f.write(("\n" if preexisting else "") + content)
     return f"Appended to: {path.relative_to(VAULT_PATH)}"
 
 
@@ -560,16 +567,54 @@ def delete_note(note: str, folder: str = "") -> str:
 
 
 @mcp.tool()
-def search_notes(query: str, folder: str = "") -> list[dict]:
-    """Full-text search across notes. Returns [{note, folder, snippet}]."""
+def move_note(note: str, source_folder: str = "", dest_folder: str = "") -> str:
+    """Move a note from source_folder to dest_folder."""
+    src = _note_path(source_folder, note)
+    if not src.exists():
+        return f"Note not found: {note}"
+    dst = _note_path(dest_folder, note)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        return f"A note named '{note}' already exists in '{dest_folder}'"
+    src.rename(dst)
+    return f"Moved: {src.relative_to(VAULT_PATH)} → {dst.relative_to(VAULT_PATH)}"
+
+
+@mcp.tool()
+def search_notes(
+    query: str,
+    folder: str = "",
+    case_sensitive: bool = False,
+    use_regex: bool = False,
+) -> list[dict]:
+    """Full-text search across notes. Returns [{note, folder, snippet}].
+
+    Args:
+        query: Search string (or regex pattern if use_regex=True).
+        folder: Restrict search to this folder (empty = whole vault).
+        case_sensitive: Match case exactly (default False).
+        use_regex: Treat query as a Python regex (default False).
+    """
+    import re as _re
+
     base = VAULT_PATH / folder if folder else VAULT_PATH
     results = []
-    q = query.lower()
+
+    flags = 0 if case_sensitive else _re.IGNORECASE
+    if use_regex:
+        try:
+            pattern = _re.compile(query, flags)
+        except _re.error as exc:
+            return [{"error": f"Invalid regex: {exc}"}]
+    else:
+        pattern = _re.compile(_re.escape(query), flags)
+
     for p in base.rglob("*.md"):
         text = p.read_text(encoding="utf-8", errors="ignore")
-        if q in text.lower():
-            idx = text.lower().find(q)
-            snippet = text[max(0, idx - 60) : idx + 120].strip()
+        m = pattern.search(text)
+        if m:
+            start = m.start()
+            snippet = text[max(0, start - 60) : start + 120].strip()
             results.append(
                 {
                     "note": p.stem,
@@ -654,10 +699,42 @@ class _Router:
 main_app = _Router()
 
 
+# ── SQLite backup ──────────────────────────────────────────────────────────────
+
+def _backup_db() -> str:
+    """Copy the live SQLite DB to a timestamped backup file. Returns backup path."""
+    src = Path(DB_PATH)
+    if not src.exists():
+        raise FileNotFoundError(f"DB not found: {DB_PATH}")
+    backup_dir = src.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    dst = backup_dir / f"auth_{ts}.db"
+    # Use sqlite3 online backup API — safe even with live writes
+    with sqlite3.connect(src) as src_conn:
+        with sqlite3.connect(dst) as dst_conn:
+            src_conn.backup(dst_conn)
+    return str(dst)
+
+
+@app.post("/admin/backup")
+async def admin_backup(request: Request):
+    """Trigger an online SQLite backup. Requires REGISTRATION_SECRET."""
+    if REGISTRATION_SECRET:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header != f"Bearer {REGISTRATION_SECRET}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        path = _backup_db()
+        return {"status": "ok", "backup": path}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ── Health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "vault": str(VAULT_PATH), "vault_exists": VAULT_PATH.exists()}
+    return {"status": "ok"}
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
