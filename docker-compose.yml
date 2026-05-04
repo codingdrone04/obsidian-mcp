@@ -8,9 +8,6 @@ services:
     volumes:
       - ${HOST_VAULT_PATH:-./vault}:/vault
       - mcp-data:/data
-
-volumes:
-  mcp-data:
     env_file:
       - .env
     healthcheck:
@@ -19,3 +16,6 @@ volumes:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+volumes:
+  mcp-data:
