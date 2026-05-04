@@ -7,6 +7,7 @@ import hashlib
 import os
 import secrets
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -38,6 +39,11 @@ clients: dict[str, dict] = {}
 auth_codes: dict[str, dict] = {}
 # access_tokens: { jti: { client_id, expires_at } }
 access_tokens: dict[str, dict] = {}
+# failed_attempts: { ip: [timestamps] }
+_failed_attempts: dict[str, list[float]] = defaultdict(list)
+
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "5"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "300"))
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -77,6 +83,16 @@ def _verify_pkce(verifier: str, challenge: str) -> bool:
     digest = hashlib.sha256(verifier.encode()).digest()
     computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
     return computed == challenge
+
+
+def _is_rate_limited(ip: str) -> bool:
+    now = time.time()
+    _failed_attempts[ip] = [t for t in _failed_attempts[ip] if now - t < RATE_LIMIT_WINDOW]
+    return len(_failed_attempts[ip]) >= RATE_LIMIT_MAX
+
+
+def _record_failed(ip: str) -> None:
+    _failed_attempts[ip].append(time.time())
 
 
 # ── FastMCP app (created early so lifespan is available for FastAPI) ──────────
@@ -219,6 +235,7 @@ async def oauth_authorize_get(
 
 @app.post("/oauth/authorize", response_class=HTMLResponse)
 async def oauth_authorize_post(
+    request: Request,
     client_id: str = Form(...),
     redirect_uri: str = Form(...),
     state: str = Form(""),
@@ -227,11 +244,17 @@ async def oauth_authorize_post(
     code_challenge: str = Form(""),
     code_challenge_method: str = Form("S256"),
 ):
+    ip = request.client.host if request.client else "unknown"
+
+    if _is_rate_limited(ip):
+        return HTMLResponse("Too many failed attempts. Try again in 5 minutes.", status_code=429)
+
     if client_id not in clients:
         raise HTTPException(status_code=400, detail="Unknown client_id")
     client = clients[client_id]
 
     if password != CONSENT_PASSWORD:
+        _record_failed(ip)
         html = _CONSENT_HTML.format(
             client_name=client["client_name"],
             client_id=client_id,
