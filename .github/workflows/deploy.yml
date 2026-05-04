@@ -6,17 +6,16 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script: |
-            cd ~/apps/obsidian-mcp
-            git pull origin main
-            docker compose up -d --build
-            docker image prune -f
+      - name: Pull latest code
+        run: |
+          cd ~/apps/obsidian-mcp
+          git pull origin main
+
+      - name: Rebuild and restart Docker
+        run: |
+          cd ~/apps/obsidian-mcp
+          docker compose up -d --build
+          docker image prune -f
