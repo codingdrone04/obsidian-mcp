@@ -12,6 +12,7 @@ __pycache__/
 dist/
 build/
 .eggs/
+.pytest_cache/
 
 # Internal session notes — not for public
 docs/SESSION_RECAP.md
