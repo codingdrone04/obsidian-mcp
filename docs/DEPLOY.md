@@ -41,16 +41,23 @@ Fill in the values:
 
 ```env
 CONSENT_PASSWORD=your_secure_password_here
+REGISTRATION_SECRET=your_registration_secret   # python3 -c "import secrets; print(secrets.token_hex(32))"
 OAUTH_DOMAIN=https://your-domain.example.com
 TOKEN_EXPIRY_SECONDS=3600
 JWT_SECRET_KEY=your_secret_key_here   # python3 -c "import secrets; print(secrets.token_hex(32))"
+VAULT_PATH=/vault                      # path inside the container (do not change)
 HOST_VAULT_PATH=/home/YOUR_USER/YourVault
 MCP_HOST=0.0.0.0
 MCP_PORT=8000
 LOG_LEVEL=info
+DB_PATH=/data/auth.db                  # SQLite, persisted via the mcp-data volume
+RATE_LIMIT_MAX=5                       # failed consent attempts per IP
+RATE_LIMIT_WINDOW=300                  # window in seconds (5 min)
 ```
 
 > `HOST_VAULT_PATH` is the absolute path to your Obsidian vault **on the host**. It gets mounted at `/vault` inside the container.
+>
+> `REGISTRATION_SECRET` guards `POST /oauth/register` and `POST /admin/backup`. Leave empty only for local dev.
 
 ---
 
@@ -68,19 +75,23 @@ docker logs -f obsidian-mcp
 ## Step 4 — Test the OAuth flow
 
 ```bash
-# Test 1: DCR
+# Test 1: DCR (add -H "Authorization: Bearer $REGISTRATION_SECRET" if set)
 curl -s -X POST https://your-domain.example.com/oauth/register \
   -H "Content-Type: application/json" \
   -d '{"client_name":"test","redirect_uris":["https://your-domain.example.com/oauth/callback"]}' | jq
 # → note client_id and client_secret
 
-# Test 2: Consent screen (open in browser)
-# https://your-domain.example.com/oauth/authorize?client_id=XXX&redirect_uri=https://your-domain.example.com/oauth/callback&state=test&response_type=code
+# PKCE is mandatory — generate a verifier + S256 challenge:
+VERIFIER=$(python3 -c "import secrets;print(secrets.token_urlsafe(48))")
+CHALLENGE=$(python3 -c "import hashlib,base64,sys;d=hashlib.sha256(sys.argv[1].encode()).digest();print(base64.urlsafe_b64encode(d).rstrip(b'=').decode())" "$VERIFIER")
 
-# Test 3: Token exchange
+# Test 2: Consent screen (open in browser — note the code_challenge params)
+# https://your-domain.example.com/oauth/authorize?client_id=XXX&redirect_uri=https://your-domain.example.com/oauth/callback&state=test&response_type=code&code_challenge=$CHALLENGE&code_challenge_method=S256
+
+# Test 3: Token exchange (code_verifier required)
 curl -s -X POST https://your-domain.example.com/oauth/token \
   -H "Content-Type: application/json" \
-  -d '{"grant_type":"authorization_code","code":"CODE","client_id":"XXX","client_secret":"YYY"}' | jq
+  -d "{\"grant_type\":\"authorization_code\",\"code\":\"CODE\",\"client_id\":\"XXX\",\"client_secret\":\"YYY\",\"code_verifier\":\"$VERIFIER\"}" | jq
 
 # Test 4: MCP call
 curl -s -H "Authorization: Bearer TOKEN" https://your-domain.example.com/mcp
