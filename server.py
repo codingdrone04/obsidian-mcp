@@ -163,6 +163,11 @@ def _token_exists(jti: str) -> bool:
     return row is not None
 
 
+def _token_delete(jti: str) -> None:
+    with _db() as conn:
+        conn.execute("DELETE FROM access_tokens WHERE jti = ?", (jti,))
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _token_id() -> str:
@@ -177,6 +182,7 @@ def _issue_jwt(client_id: str) -> tuple[str, int]:
         "jti": jti,
         "exp": exp,
         "iat": int(time.time()),
+        "aud": OAUTH_DOMAIN,
         "scope": "obsidian:read obsidian:write",
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -186,11 +192,18 @@ def _issue_jwt(client_id: str) -> tuple[str, int]:
 
 def _validate_bearer(token: str) -> dict:
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        # Audience is checked manually below so tokens issued before the `aud`
+        # claim existed keep validating (smooth migration).
+        payload = jwt.decode(
+            token, JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False}
+        )
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+    aud = payload.get("aud")
+    if aud and aud != OAUTH_DOMAIN:
+        raise HTTPException(status_code=401, detail="Invalid audience")
     jti = payload.get("jti")
     if not _token_exists(jti):
         raise HTTPException(status_code=401, detail="Token revoked or unknown")
@@ -474,6 +487,41 @@ async def oauth_token(request: Request):
     }
 
 
+# ── OAuth: Token revocation (RFC 7009) ─────────────────────────────────────────
+@app.post("/oauth/revoke")
+async def oauth_revoke(request: Request):
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+    else:
+        body = dict(await request.form())
+
+    # Client authentication is required to revoke (RFC 7009 §2.1).
+    client_id = body.get("client_id")
+    client_secret = body.get("client_secret")
+    client = _client_get(client_id) if client_id else None
+    if not client or not client_secret or not secrets.compare_digest(
+        client["client_secret"], client_secret
+    ):
+        raise HTTPException(status_code=401, detail="Invalid client credentials")
+
+    token = body.get("token", "")
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False, "verify_exp": False},
+        )
+        jti = payload.get("jti")
+        # Only the owning client may revoke its own token.
+        if jti and payload.get("sub") == client_id:
+            _token_delete(jti)
+    except jwt.InvalidTokenError:
+        pass  # RFC 7009: an invalid token still yields 200.
+    return {"status": "revoked"}
+
+
 # ── OAuth metadata (RFC 8414) ─────────────────────────────────────────────────
 @app.get("/.well-known/oauth-protected-resource")
 @app.get("/.well-known/oauth-protected-resource/{path:path}")
@@ -492,6 +540,7 @@ async def oauth_metadata():
         "issuer": OAUTH_DOMAIN,
         "authorization_endpoint": f"{OAUTH_DOMAIN}/oauth/authorize",
         "token_endpoint": f"{OAUTH_DOMAIN}/oauth/token",
+        "revocation_endpoint": f"{OAUTH_DOMAIN}/oauth/revoke",
         "registration_endpoint": f"{OAUTH_DOMAIN}/oauth/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
@@ -750,10 +799,14 @@ def _backup_db() -> str:
 @app.post("/admin/backup")
 async def admin_backup(request: Request):
     """Trigger an online SQLite backup. Requires REGISTRATION_SECRET."""
-    if REGISTRATION_SECRET:
-        auth_header = request.headers.get("Authorization", "")
-        if not secrets.compare_digest(auth_header, f"Bearer {REGISTRATION_SECRET}"):
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if not REGISTRATION_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Backup disabled: set REGISTRATION_SECRET to enable this endpoint",
+        )
+    auth_header = request.headers.get("Authorization", "")
+    if not secrets.compare_digest(auth_header, f"Bearer {REGISTRATION_SECRET}"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         path = _backup_db()
         return {"status": "ok", "backup": path}

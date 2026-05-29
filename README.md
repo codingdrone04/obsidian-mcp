@@ -25,6 +25,7 @@ This server implements the full [OAuth 2.1 Authorization Code flow](docs/OAUTH.m
 | `POST /oauth/register` | Dynamic Client Registration (Bearer `REGISTRATION_SECRET` if set) |
 | `GET /oauth/authorize` | Consent screen (PKCE S256 required) |
 | `POST /oauth/token` | Exchange code → Bearer token |
+| `POST /oauth/revoke` | Revoke a token (RFC 7009, client auth required) |
 | `GET /.well-known/oauth-authorization-server` | OAuth metadata |
 | `/mcp/*` | MCP tools (Bearer required) |
 | `POST /admin/backup` | Online SQLite backup (Bearer `REGISTRATION_SECRET` if set) |
