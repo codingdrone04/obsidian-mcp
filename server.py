@@ -203,6 +203,18 @@ def _verify_pkce(verifier: str, challenge: str) -> bool:
     return computed == challenge
 
 
+def _client_ip(request: Request) -> str:
+    """Real client IP. Behind Cloudflare Tunnel, request.client.host is always
+    127.0.0.1, so trust CF-Connecting-IP / X-Forwarded-For first."""
+    cf = request.headers.get("cf-connecting-ip")
+    if cf:
+        return cf.strip()
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def _is_rate_limited(ip: str) -> bool:
     now = time.time()
     _failed_attempts[ip] = [t for t in _failed_attempts[ip] if now - t < RATE_LIMIT_WINDOW]
@@ -237,7 +249,7 @@ async def oauth_register(body: DCRRequest, request: Request):
     if REGISTRATION_SECRET:
         auth_header = request.headers.get("Authorization", "")
         expected = f"Bearer {REGISTRATION_SECRET}"
-        if auth_header != expected:
+        if not secrets.compare_digest(auth_header, expected):
             raise HTTPException(status_code=401, detail="Invalid registration secret")
     client_id = secrets.token_urlsafe(16)
     client_secret = secrets.token_urlsafe(32)
@@ -345,6 +357,10 @@ async def oauth_authorize_get(
         raise HTTPException(status_code=400, detail="Unknown client_id")
     if redirect_uri not in client["redirect_uris"]:
         raise HTTPException(status_code=400, detail="redirect_uri not registered")
+    if not code_challenge:
+        raise HTTPException(status_code=400, detail="code_challenge required (PKCE)")
+    if code_challenge_method != "S256":
+        raise HTTPException(status_code=400, detail="Only S256 PKCE is supported")
     html = _CONSENT_HTML.format(
         client_name=client["client_name"],
         client_id=client_id,
@@ -368,7 +384,7 @@ async def oauth_authorize_post(
     code_challenge: str = Form(""),
     code_challenge_method: str = Form("S256"),
 ):
-    ip = request.client.host if request.client else "unknown"
+    ip = _client_ip(request)
 
     if _is_rate_limited(ip):
         return HTMLResponse("Too many failed attempts. Try again in 5 minutes.", status_code=429)
@@ -376,8 +392,12 @@ async def oauth_authorize_post(
     client = _client_get(client_id)
     if not client:
         raise HTTPException(status_code=400, detail="Unknown client_id")
+    if redirect_uri not in client["redirect_uris"]:
+        raise HTTPException(status_code=400, detail="redirect_uri not registered")
+    if not code_challenge or code_challenge_method != "S256":
+        raise HTTPException(status_code=400, detail="S256 code_challenge required (PKCE)")
 
-    if password != CONSENT_PASSWORD:
+    if not secrets.compare_digest(password, CONSENT_PASSWORD):
         _record_failed(ip)
         html = _CONSENT_HTML.format(
             client_name=client["client_name"],
@@ -431,17 +451,18 @@ async def oauth_token(request: Request):
         raise HTTPException(status_code=400, detail="client_id mismatch")
 
     stored_challenge = code_data.get("code_challenge", "")
-    if stored_challenge:
-        code_verifier = body.get("code_verifier", "")
-        if not code_verifier:
-            raise HTTPException(status_code=400, detail="code_verifier required")
-        if not _verify_pkce(code_verifier, stored_challenge):
-            raise HTTPException(status_code=400, detail="PKCE verification failed")
+    if not stored_challenge:
+        raise HTTPException(status_code=400, detail="PKCE required")
+    code_verifier = body.get("code_verifier", "")
+    if not code_verifier:
+        raise HTTPException(status_code=400, detail="code_verifier required")
+    if not _verify_pkce(code_verifier, stored_challenge):
+        raise HTTPException(status_code=400, detail="PKCE verification failed")
 
     client = _client_get(client_id)
     if not client:
         raise HTTPException(status_code=401, detail="Unknown client")
-    if client["client_secret"] != client_secret:
+    if not client_secret or not secrets.compare_digest(client["client_secret"], client_secret):
         raise HTTPException(status_code=401, detail="Invalid client_secret")
 
     token, expires_in = _issue_jwt(client_id)
@@ -492,12 +513,21 @@ async def require_auth(
 # ── MCP tools ─────────────────────────────────────────────────────────────────
 
 
-def _note_path(folder: str, note: str) -> Path:
-    p = VAULT_PATH / folder / f"{note}.md" if folder else VAULT_PATH / f"{note}.md"
-    p = p.resolve()
-    if not str(p).startswith(str(VAULT_PATH.resolve())):
+def _safe_path(*parts: str) -> Path:
+    """Resolve a path under the vault, rejecting any traversal outside of it."""
+    p = VAULT_PATH.joinpath(*[part for part in parts if part]).resolve()
+    if not p.is_relative_to(VAULT_PATH.resolve()):
         raise ValueError("Path traversal detected")
     return p
+
+
+def _safe_dir(folder: str) -> Path:
+    """Resolve a folder under the vault (rejects traversal)."""
+    return _safe_path(folder)
+
+
+def _note_path(folder: str, note: str) -> Path:
+    return _safe_path(folder, f"{note}.md")
 
 
 @mcp.tool()
@@ -515,7 +545,7 @@ def list_folders() -> list[str]:
 @mcp.tool()
 def list_notes(folder: str = "") -> list[str]:
     """List all Markdown notes in a folder (empty = root)."""
-    base = VAULT_PATH / folder if folder else VAULT_PATH
+    base = _safe_dir(folder)
     if not base.exists():
         return []
     return sorted(
@@ -597,7 +627,7 @@ def search_notes(
     """
     import re as _re
 
-    base = VAULT_PATH / folder if folder else VAULT_PATH
+    base = _safe_dir(folder)
     results = []
 
     flags = 0 if case_sensitive else _re.IGNORECASE
@@ -722,7 +752,7 @@ async def admin_backup(request: Request):
     """Trigger an online SQLite backup. Requires REGISTRATION_SECRET."""
     if REGISTRATION_SECRET:
         auth_header = request.headers.get("Authorization", "")
-        if auth_header != f"Bearer {REGISTRATION_SECRET}":
+        if not secrets.compare_digest(auth_header, f"Bearer {REGISTRATION_SECRET}"):
             raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         path = _backup_db()
