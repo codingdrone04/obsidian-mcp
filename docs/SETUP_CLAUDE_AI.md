@@ -38,7 +38,11 @@ Response:
 
 **Save these values** — you'll need them in Claude.ai settings.
 
-> Note: Tokens are in-memory. If the server restarts, re-run this step.
+> Note: clients, codes and tokens are persisted in SQLite, so a server restart
+> no longer drops your session. You only need to register once per client.
+>
+> If the server sets `REGISTRATION_SECRET`, add `-H "Authorization: Bearer <secret>"`
+> to this request or it returns `401`.
 
 ---
 
@@ -73,7 +77,7 @@ https://your-domain.example.com/oauth/authorize?client_id=...&redirect_uri=...&s
 
 Enter your `CONSENT_PASSWORD` and click **Authorize**.
 
-You'll be redirected back to Claude.ai, which exchanges the code for a Bearer token automatically.
+You'll be redirected back to Claude.ai, which exchanges the code for a Bearer token automatically. Claude.ai handles PKCE (S256) transparently — no manual step needed.
 
 ---
 
@@ -93,7 +97,7 @@ Claude should call the MCP tools and return real data from your vault.
 
 ### "Unknown client_id"
 
-The server was restarted and lost in-memory state. Re-run Step 1 and update the credentials in Claude.ai settings.
+The client was never registered (or its row was removed). Re-run Step 1 and update the credentials in Claude.ai settings. Note: state is persisted in SQLite, so a plain restart no longer causes this.
 
 ### Consent screen shows error after password
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This server implements **OAuth 2.1 Authorization Code flow** with **Dynamic Client Registration (RFC 7591)**.
+This server implements **OAuth 2.1 Authorization Code flow** with **Dynamic Client Registration (RFC 7591)** and **mandatory PKCE (S256)**.
 
 ```
 Claude.ai custom connector
@@ -12,6 +12,7 @@ POST /oauth/register          ← DCR: get client_id + client_secret
         │
         ▼
 GET  /oauth/authorize          ← Redirect user to consent screen
+   (+ code_challenge, S256)       PKCE challenge required
         │
         ▼
  ┌─────────────┐
@@ -22,7 +23,7 @@ GET  /oauth/authorize          ← Redirect user to consent screen
 Redirect → redirect_uri?code=<authorization_code>&state=<state>
         │
         ▼
-POST /oauth/token              ← Exchange code for access token
+POST /oauth/token              ← Exchange code (+ code_verifier) for access token
         │
         ▼
 { "access_token": "<JWT>", "token_type": "Bearer" }
@@ -62,6 +63,9 @@ GET/POST /mcp                  ← All MCP calls use Bearer token
 
 Store `client_id` and `client_secret` — needed for every step.
 
+> If `REGISTRATION_SECRET` is set on the server, `/oauth/register` requires an
+> `Authorization: Bearer <REGISTRATION_SECRET>` header — otherwise it returns `401`.
+
 ### 2. Authorization request
 
 Redirect the user to:
@@ -72,9 +76,15 @@ GET /oauth/authorize
   &redirect_uri=https://claude.ai/api/mcp/auth_callback
   &state=<random-csrf-token>
   &response_type=code
+  &code_challenge=<base64url(SHA256(verifier))>
+  &code_challenge_method=S256
 ```
 
 The server renders the consent screen. The user enters `CONSENT_PASSWORD`.
+
+> **PKCE is mandatory.** A request without `code_challenge`, or with a
+> `code_challenge_method` other than `S256`, is rejected with `400`. Claude.ai
+> sends these automatically.
 
 ### 3. Authorization response
 
@@ -96,7 +106,8 @@ The `state` parameter must match the value sent in step 2 (CSRF protection).
   "grant_type": "authorization_code",
   "code": "<auth_code>",
   "client_id": "abc123",
-  "client_secret": "xyz789"
+  "client_secret": "xyz789",
+  "code_verifier": "<original PKCE verifier>"
 }
 
 // Response
@@ -108,7 +119,9 @@ The `state` parameter must match the value sent in step 2 (CSRF protection).
 }
 ```
 
-Authorization codes are **single-use** and expire in 10 minutes.
+Authorization codes are **single-use** and expire in 10 minutes. The
+`code_verifier` is **required** — the server checks `SHA256(verifier) ==
+code_challenge` (base64url) before issuing a token.
 
 ### 5. Authenticated MCP calls
 
@@ -146,13 +159,16 @@ Every call to `/mcp/*` must include this header. The server validates:
 | Concern | Mitigation |
 |---|---|
 | CSRF on authorize | `state` parameter must match |
+| Auth-code interception | Mandatory PKCE (S256) — `code_verifier` checked at token exchange |
+| Open redirect / code leak | `redirect_uri` validated against registered URIs at both `GET` and `POST /oauth/authorize` |
 | Token theft | Short expiry (1h), HTTPS required in prod |
-| Replay attacks | `jti` stored in memory, single-use codes |
-| Path traversal | All vault paths resolved and checked against vault root |
-| Brute force on consent | Rate limiting via WAF (Cloudflare) recommended |
+| Replay attacks | `jti` persisted in SQLite, single-use codes |
+| Path traversal | All vault paths resolved and checked against vault root (`is_relative_to`) |
+| Brute force on consent | Built-in per-IP rate limiting (`RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW`); real IP read from `CF-Connecting-IP` behind Cloudflare |
+| Timing attacks on secrets | Constant-time comparison (`secrets.compare_digest`) for password / client_secret / registration secret |
 | Secrets in env | `.env` never committed, `.gitignore` enforced |
 
-**Tokens are stored in memory** — they are lost on server restart. Clients must re-authenticate after a restart.
+**Tokens are persisted in SQLite** (`DB_PATH`, default `/data/auth.db`, mounted on the `mcp-data` volume). Clients, auth codes and tokens survive a server restart; expired rows are purged on startup.
 
 ---
 
@@ -172,8 +188,10 @@ Claude.ai auto-discovers endpoints from this URL.
 
 | Error | Cause | Fix |
 |---|---|---|
-| `Unknown client_id` | DCR not done or server restarted | Re-register via `/oauth/register` |
+| `Unknown client_id` | DCR never done for this client | Re-register via `/oauth/register` (state now persists across restarts) |
 | `Invalid or expired code` | Code used twice or >10min elapsed | Restart auth flow |
 | `Token expired` | JWT past `exp` | Re-authenticate |
 | `redirect_uri not registered` | URI mismatch | Register exact URI via DCR |
+| `code_challenge required (PKCE)` | Authorize request missing `code_challenge` | Send `code_challenge` + `code_challenge_method=S256` |
+| `code_verifier required` / `PKCE verification failed` | Missing/mismatched verifier at token exchange | Send the original `code_verifier` |
 | 401 on `/mcp` | Missing or invalid Bearer | Check token, re-auth if needed |
