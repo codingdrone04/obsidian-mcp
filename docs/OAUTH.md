@@ -134,6 +134,23 @@ Every call to `/mcp/*` must include this header. The server validates:
 - Token expiry (`exp` claim)
 - Token is in the active store (not revoked)
 
+### 6. Token revocation (RFC 7009)
+
+`POST /oauth/revoke`
+
+```json
+{
+  "token": "<JWT to revoke>",
+  "client_id": "abc123",
+  "client_secret": "xyz789"
+}
+```
+
+Client authentication is required, and a client may only revoke its own tokens.
+The `jti` is deleted from the active store, so the token fails immediately on the
+next `/mcp` call. Per RFC 7009, revoking an already-invalid token still returns
+`200`. The endpoint is advertised as `revocation_endpoint` in the OAuth metadata.
+
 ---
 
 ## JWT structure
@@ -148,9 +165,14 @@ Every call to `/mcp/*` must include this header. The server validates:
   "jti": "<unique token id>",
   "exp": 1735000000,
   "iat": 1734996400,
+  "aud": "<OAUTH_DOMAIN>",
   "scope": "obsidian:read obsidian:write"
 }
 ```
+
+The `aud` claim binds the token to this server (`OAUTH_DOMAIN`) and is verified at
+every `/mcp` call. Tokens issued before this claim existed remain valid until they
+expire (backward-compatible migration).
 
 ---
 
