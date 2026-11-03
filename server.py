@@ -5,6 +5,7 @@ FastMCP 2.0 mounted on FastAPI with full Authorization Code flow.
 import base64
 import contextlib
 import hashlib
+import html
 import json
 import os
 import secrets
@@ -14,6 +15,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import jwt
 from dotenv import load_dotenv
@@ -26,12 +28,21 @@ from fastmcp import FastMCP
 
 load_dotenv()
 
+
+def _require_env(name: str) -> str:
+    """Refuse to start without a secret — the repo is public, so no default is safe."""
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} must be set")
+    return value
+
+
 # ── Config ────────────────────────────────────────────────────────────────────
 VAULT_PATH = Path(os.getenv("VAULT_PATH", "/vault"))
 OAUTH_DOMAIN = os.getenv("OAUTH_DOMAIN", "http://localhost:8000")
-CONSENT_PASSWORD = os.getenv("CONSENT_PASSWORD", "changeme123")
+CONSENT_PASSWORD = _require_env("CONSENT_PASSWORD")
 REGISTRATION_SECRET = os.getenv("REGISTRATION_SECRET", "")
-JWT_SECRET = os.getenv("JWT_SECRET_KEY", "dev-secret-change-in-production")
+JWT_SECRET = _require_env("JWT_SECRET_KEY")
 TOKEN_EXPIRY = int(os.getenv("TOKEN_EXPIRY_SECONDS", "3600"))
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
@@ -244,7 +255,14 @@ mcp = FastMCP("obsidian")
 _mcp_http_app = mcp.http_app(path="/")
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
-app = FastAPI(title="Obsidian MCP", version="2.0.0", lifespan=_mcp_http_app.lifespan)
+app = FastAPI(
+    title="Obsidian MCP",
+    version="2.0.0",
+    lifespan=_mcp_http_app.lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -356,6 +374,25 @@ _CONSENT_HTML = """<!DOCTYPE html>
 </html>"""
 
 
+# form-action stays open: the consent POST redirects to the client's redirect_uri.
+_CONSENT_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; "
+        "base-uri 'none'; frame-ancestors 'none'"
+    ),
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+def _consent_page(error: str = "", **fields: str) -> HTMLResponse:
+    """Render the consent screen. Every field is escaped: state and code_challenge
+    come straight from the query string, client_name from registration."""
+    escaped = {k: html.escape(v, quote=True) for k, v in fields.items()}
+    return HTMLResponse(_CONSENT_HTML.format(error=error, **escaped), headers=_CONSENT_HEADERS)
+
+
 @app.get("/oauth/authorize", response_class=HTMLResponse)
 async def oauth_authorize_get(
     client_id: str,
@@ -374,16 +411,14 @@ async def oauth_authorize_get(
         raise HTTPException(status_code=400, detail="code_challenge required (PKCE)")
     if code_challenge_method != "S256":
         raise HTTPException(status_code=400, detail="Only S256 PKCE is supported")
-    html = _CONSENT_HTML.format(
+    return _consent_page(
         client_name=client["client_name"],
         client_id=client_id,
         redirect_uri=redirect_uri,
         state=state,
         code_challenge=code_challenge,
         code_challenge_method=code_challenge_method,
-        error="",
     )
-    return HTMLResponse(html)
 
 
 @app.post("/oauth/authorize", response_class=HTMLResponse)
@@ -412,16 +447,15 @@ async def oauth_authorize_post(
 
     if not secrets.compare_digest(password, CONSENT_PASSWORD):
         _record_failed(ip)
-        html = _CONSENT_HTML.format(
+        return _consent_page(
+            error='<p class="error">Mot de passe incorrect.</p>',
             client_name=client["client_name"],
             client_id=client_id,
             redirect_uri=redirect_uri,
             state=state,
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
-            error='<p class="error">Mot de passe incorrect.</p>',
         )
-        return HTMLResponse(html, status_code=200)
 
     code = secrets.token_urlsafe(32)
     _code_save(code, {
@@ -432,7 +466,7 @@ async def oauth_authorize_post(
         "code_challenge_method": code_challenge_method,
     })
     sep = "&" if "?" in redirect_uri else "?"
-    location = f"{redirect_uri}{sep}code={code}&state={state}"
+    location = f"{redirect_uri}{sep}code={code}&state={quote(state, safe='')}"
     return RedirectResponse(location, status_code=302)
 
 
