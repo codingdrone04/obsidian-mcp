@@ -1,7 +1,9 @@
-fastmcp>=1.0.0
-uvicorn[standard]>=0.24.0
-fastapi>=0.104.0
-python-dotenv>=1.0.0
-pydantic>=2.0.0
-PyJWT>=2.8.0
-python-multipart>=0.0.6
+fastmcp==3.4.11
+mcp==1.30.0
+uvicorn[standard]==0.54.0
+fastapi==0.162.0
+starlette==1.10.0
+python-dotenv==1.2.4
+pydantic==2.14.2
+PyJWT==2.15.1
+python-multipart==0.0.33
