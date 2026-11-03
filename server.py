@@ -12,19 +12,18 @@ import secrets
 import sqlite3
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 from urllib.parse import quote
 
 import jwt
+import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException, Request, Depends
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
-import uvicorn
 from fastmcp import FastMCP
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -586,7 +585,7 @@ async def oauth_metadata():
 
 # ── Auth dependency for MCP tools ─────────────────────────────────────────────
 async def require_auth(
-    creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    creds: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),  # noqa: B008
 ) -> dict:
     if not creds:
         raise HTTPException(status_code=401, detail="Missing Bearer token")
@@ -821,12 +820,11 @@ def _backup_db() -> str:
         raise FileNotFoundError(f"DB not found: {DB_PATH}")
     backup_dir = src.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     dst = backup_dir / f"auth_{ts}.db"
     # Use sqlite3 online backup API — safe even with live writes
-    with sqlite3.connect(src) as src_conn:
-        with sqlite3.connect(dst) as dst_conn:
-            src_conn.backup(dst_conn)
+    with sqlite3.connect(src) as src_conn, sqlite3.connect(dst) as dst_conn:
+        src_conn.backup(dst_conn)
     return str(dst)
 
 
@@ -844,7 +842,7 @@ async def admin_backup(request: Request):
     try:
         path = _backup_db()
         return {"status": "ok", "backup": path}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc))
 
 
