@@ -242,3 +242,47 @@ def test_safe_dir_blocks_traversal(folder):
 def test_safe_dir_allows_subfolder():
     # Resolves inside the vault without raising.
     assert server._safe_dir("sub").name == "sub"
+
+
+def test_consent_page_escapes_query_params():
+    cid, _ = _register()
+    payload = '"><script>alert(1)</script>'
+    r = client.get(
+        "/oauth/authorize",
+        params={
+            "client_id": cid,
+            "redirect_uri": REDIRECT_URI,
+            "state": payload,
+            "code_challenge": payload,
+            "code_challenge_method": "S256",
+        },
+    )
+    assert r.status_code == 200
+    assert "<script>" not in r.text
+    assert "frame-ancestors 'none'" in r.headers["content-security-policy"]
+
+
+def test_state_is_encoded_in_redirect():
+    cid, _ = _register()
+    _, challenge = _pkce()
+    r = client.post(
+        "/oauth/authorize",
+        data={
+            "client_id": cid,
+            "redirect_uri": REDIRECT_URI,
+            "state": "a&code=evil",
+            "password": "testpass",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 302
+    query = parse_qs(urlparse(r.headers["location"]).query)
+    assert query["state"] == ["a&code=evil"]
+    assert len(query["code"]) == 1
+
+
+def test_api_docs_are_disabled():
+    assert client.get("/docs").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
